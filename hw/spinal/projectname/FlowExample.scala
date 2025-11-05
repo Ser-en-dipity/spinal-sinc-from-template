@@ -55,18 +55,32 @@ case class Comb(outputWidth: Int) extends Component {
         delay := io.input.payload
     }
 }
-case class MySinc2(dr: Int, width: Int, order: Int) extends Component {
+case class SincGenerics(
+    val dr: Int = 32,
+    val order: Int = 3,
+    val outputWidthOrDefault: Int = 0,
+    val maxOrder: Int = 6
+)
+
+case class MySinc2(sincGenerics: SincGenerics) extends Component {
+    val outputWidth = 2 + sincGenerics.order *  log2Up(sincGenerics.dr) // output width = input width + order * log2(DR) , input width = 1, sign width 1 bit
     val io = new Bundle {
-        val input = slave(Flow(SInt(width bits)))
-        val output = master(Flow(SInt(width bits)))
+        val input = slave(Flow(Bool()))  // PWM 使用 Bool 类型
+        val output = master(Flow(SInt(outputWidth bits)))
     }
-    val integrators = List.fill(order)(Integrator(width))
-    val decimator = Decimator(dr, width)
-    val combs = List.fill(order)(Comb(width))
+    val integrators = List.fill(sincGenerics.order)(Integrator(outputWidth))
+    val decimator = Decimator(sincGenerics.dr, outputWidth)
+    val combs = List.fill(sincGenerics.order)(Comb(outputWidth))
 
     // 连接流水线组件
     integrators.zipWithIndex.foreach { case (integrator, i) =>
-        integrator.io.input <> (if (i == 0) io.input else integrators(i - 1).io.output)
+        if (i == 0) {
+            // 第一个积分器：需要扩展 Bool 输入到 outputWidth
+            integrator.io.input.valid := io.input.valid
+            integrator.io.input.payload := io.input.payload.asSInt.resize(outputWidth)
+        } else {
+            integrator.io.input <> integrators(i - 1).io.output
+        }
     }
     decimator.io.input <> integrators.last.io.output
     combs.zipWithIndex.foreach { case (comb, i) =>
@@ -78,16 +92,16 @@ case class MySinc2(dr: Int, width: Int, order: Int) extends Component {
 
 object MySincTest extends App {
   // 测试 PWM 正弦波输入
-  SimConfig.withWave.compile(new MySinc2(dr = 8, width = 16, order = 3)).doSim { dut =>
+  SimConfig.withWave.compile(new MySinc2(SincGenerics(dr = 32, order = 3))).doSim { dut =>
     import scala.math._
     import scala.util.Random
     
-    // 启动时钟和复位
-    dut.clockDomain.forkStimulus(period = 10)
+    // 启动时钟和复位 (period = 8 ns -> 125 MHz)
+    dut.clockDomain.forkStimulus(period = 8)
     
     // 初始化输入
     dut.io.input.valid #= true
-    dut.io.input.payload #= 0
+    dut.io.input.payload #= false  // 初始化为0
     
     // 等待复位完成
     dut.clockDomain.waitRisingEdge()
@@ -127,7 +141,7 @@ object MySincTest extends App {
       val pwm = 2 * amplitude * pwmThreshold
       
       // PWM 比较: 如果归一化值大于阈值则输出1，否则0
-      val pwmBit = if (duty > pwm) 1 else 0
+      val pwmBit = if (duty > pwm) true else false
       
       // 将正弦波值转换为整数（用于调试显示）
       val sineInt = (amplitude * sineValue).toInt
