@@ -61,16 +61,38 @@ case class SincGenerics(
     val outputWidthOrDefault: Int = 0,
     val maxOrder: Int = 6
 )
+case class FractionNDivider() extends Component {
+    val io = new Bundle {
+        val clk_out = out Bool()
+    }
+    
+    val clk_divided = Reg(Bool()) init(False)
+    val cnt = Reg(UInt(32 bits)) init(0)
+    
+    io.clk_out := clk_divided
+    
+    when(cnt < 2) {
+        cnt := cnt + 1
+    } otherwise {
+        cnt := 0
+        clk_divided := ~clk_divided
+    }
+}
 
 case class MySinc2(sincGenerics: SincGenerics) extends Component {
     val outputWidth = 2 + sincGenerics.order *  log2Up(sincGenerics.dr) // output width = input width + order * log2(DR) , input width = 1, sign width 1 bit
     val io = new Bundle {
         val input = slave(Flow(Bool()))  // PWM 使用 Bool 类型
         val output = master(Flow(SInt(outputWidth bits)))
+        val clk_divided = out Bool()  // 分频后的时钟输出
     }
     val integrators = List.fill(sincGenerics.order)(Integrator(outputWidth))
     val decimator = Decimator(sincGenerics.dr, outputWidth)
     val combs = List.fill(sincGenerics.order)(Comb(outputWidth))
+    
+    // 实例化分频器
+    val clockDivider = FractionNDivider()
+    io.clk_divided := clockDivider.io.clk_out
 
     // 连接流水线组件
     integrators.zipWithIndex.foreach { case (integrator, i) =>
@@ -96,8 +118,10 @@ object MySincTest extends App {
     import scala.math._
     import scala.util.Random
     
-    // 启动时钟和复位 (period = 8 ns -> 125 MHz)
-    dut.clockDomain.forkStimulus(period = 8)
+    // 启动时钟和复位
+    // Verilator 的 VCD timescale 是 1ps
+    // period = 8000 表示 8000ps = 8ns = 125 MHz
+    dut.clockDomain.forkStimulus(period = 8000)
     
     // 初始化输入
     dut.io.input.valid #= true
@@ -156,12 +180,13 @@ object MySincTest extends App {
       // 读取输出
       val output = dut.io.output.payload.toInt
       val valid = dut.io.output.valid.toBoolean
+      val clkDiv = dut.io.clk_divided.toBoolean
       
       // 只在valid=true时打印（有效的抽取输出）
       if (valid) {
         val gain = 512.0  // DR^Order = 8^3 = 512
         val scaledOutput = output / gain
-        println(f"样本 $sample%6d: 时间=${t*1000}%.3fms, 正弦=$sineInt%4d, 输出=$output%8d, 缩放=$scaledOutput%6.2f")
+        println(f"样本 $sample%6d: 时间=${t*1000}%.3fms, 正弦=$sineInt%4d, 输出=$output%8d, 缩放=$scaledOutput%6.2f, clkDiv=$clkDiv")
       }
       
       // 进度指示
