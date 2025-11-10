@@ -78,6 +78,48 @@ case class FractionNDivider() extends Component {
         clk_divided := ~clk_divided
     }
 }
+case class Sampler() extends  Component {
+    val io = new Bundle {
+        val clk_in = in Bool()
+        val data_in = in Bool()
+        val data_out = out Bool()
+    }
+
+    val sample0 = Reg(Bool()) init(False)
+    val sample1 = Reg(Bool()) init(False)
+    val sample2 = Reg(Bool()) init(False)
+    val cnt = Reg(UInt(3 bits)) init(0)
+    
+    // 用125MHz主时钟进行6次采样（cnt: 0->1->2->3->4->5->0...）
+    // 关键：先判断再递增，否则采样时机错误
+    when(cnt === 0) {
+        sample0 := io.data_in
+        cnt := 1
+    } elsewhen (cnt === 1) {
+        cnt := 2
+    } elsewhen (cnt === 2) {
+        sample1 := io.data_in
+        cnt := 3
+    } elsewhen (cnt === 3) {
+        cnt := 4
+    } elsewhen (cnt === 4) {
+        sample2 := io.data_in
+        cnt := 5
+    } otherwise {  // cnt === 5
+        cnt := 0  // 重置，开始新一轮采样
+    }
+    
+    // 简单多数投票 (需要2位宽度来表示0-3)
+    // 先扩展到足够宽度再相加，避免溢出
+    val sum = sample0.asUInt.resize(2) + sample1.asUInt.resize(2) + sample2.asUInt.resize(2)
+    val voted = sum >= U(2, 2 bits)
+    
+    // 用寄存器输出，避免时序问题
+    val data_out_reg = Reg(Bool()) init(False)
+    data_out_reg := voted
+    io.data_out := data_out_reg
+
+}
 
 case class MySinc2(sincGenerics: SincGenerics) extends Component {
     val outputWidth = 2 + sincGenerics.order *  log2Up(sincGenerics.dr) // output width = input width + order * log2(DR) , input width = 1, sign width 1 bit
@@ -110,6 +152,97 @@ case class MySinc2(sincGenerics: SincGenerics) extends Component {
     }
     io.output <> combs.last.io.output
 
+}
+
+object SamplerTest extends App {
+  // 测试 Sampler 模块
+  SimConfig.withWave.compile(new Sampler()).doSim { dut =>
+    import scala.math._
+    import scala.util.Random
+    
+    // 启动主时钟 125 MHz
+    dut.clockDomain.forkStimulus(period = 8000) // 8000ps = 8ns = 125 MHz
+    
+    // 初始化输入
+    dut.io.clk_in #= false
+    dut.io.data_in #= false
+    
+    // 等待复位完成
+    dut.clockDomain.waitRisingEdge()
+    
+    println("=" * 60)
+    println("测试 Sampler 模块")
+    println("主时钟: 125 MHz (8ns)")
+    println("输入时钟: 20 MHz (50ns)")
+    println("采样策略: 3次采样 + 多数投票")
+    println("=" * 60)
+    
+    val random = new Random()
+    val mainClkPeriod = 8.0      // ns (125 MHz)
+    val inputClkFreq = 20000000.0 // 20 MHz
+    val inputClkPeriod = 50.0     // ns (20 MHz)
+    val totalSamples = 1000       // 测试样本数
+    
+    // 生成测试数据：交替的比特流和随机噪声
+    var clkPhase = 0.0
+    var dataPhase = 0
+    var lastClk = false
+    
+    for (sample <- 0 until totalSamples) {
+      val t = sample * mainClkPeriod  // 当前时间 (ns)
+      
+      // 生成 20MHz 输入时钟
+      val clkValue = ((t % inputClkPeriod) < (inputClkPeriod / 2))
+      
+      // 检测时钟上升沿，在上升沿改变数据
+      val clkRisingEdge = clkValue && !lastClk
+      if (clkRisingEdge) {
+        // 每个时钟周期切换数据模式
+        dataPhase = (dataPhase + 1) % 8
+      }
+      lastClk = clkValue
+      
+      // 生成测试数据模式
+      val idealData = dataPhase match {
+        case 0 | 1 => true   // 连续的1
+        case 2 | 3 => false  // 连续的0
+        case 4 => true       // 交替模式
+        case 5 => false
+        case 6 => random.nextBoolean()  // 随机数据
+        case 7 => random.nextBoolean()
+      }
+      
+      // 添加噪声（10%概率翻转）
+      val noisyData = if (random.nextDouble() < 0.1) !idealData else idealData
+      
+      // 设置输入
+      dut.io.clk_in #= clkValue
+      dut.io.data_in #= noisyData
+      
+      // 等待时钟
+      dut.clockDomain.waitRisingEdge()
+      
+      // 读取输出
+      val output = dut.io.data_out.toBoolean
+      
+      // 每50个样本打印一次状态
+      if (sample % 50 == 0 || clkRisingEdge) {
+        println(f"样本 $sample%4d: 时间=${t}%.1fns, " +
+                f"clk_in=$clkValue%5s, data_in=$noisyData%5s (理想=$idealData%5s), " +
+                f"data_out=$output%5s" + 
+                (if (clkRisingEdge) " ← 时钟上升沿" else ""))
+      }
+      
+      // 进度指示
+      if (sample % 200 == 0 && sample > 0) {
+        println(s"  [进度] 已处理 $sample 个样本...")
+      }
+    }
+    
+    println("=" * 60)
+    println("Sampler 模块测试完成! VCD 波形文件已生成")
+    println("=" * 60)
+  }
 }
 
 object MySincTest extends App {
