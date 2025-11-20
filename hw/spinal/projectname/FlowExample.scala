@@ -5,6 +5,26 @@ import spinal.lib._
 import spinal.core.sim._
 import spinal.sim._
 
+case class IdealSigmaDeltaModulator(val order: Int = 2, val ref: BigDecimal = 1.0) {
+  private var integral_values = List.fill(order)(BigDecimal(0.0))
+  private def integrate_once(din: BigDecimal, fed: BigDecimal, stageIndex: Int): BigDecimal = {
+    val diff: BigDecimal = stageIndex match {
+      case 0 => din - fed
+      case _ => integrate_once(din, fed, stageIndex - 1) - fed
+    }
+    val ret: BigDecimal = integral_values(stageIndex) + diff
+    integral_values = integral_values.updated(stageIndex, ret)
+    ret
+  }
+  private def integrate(din: BigDecimal, fed: BigDecimal): BigDecimal = { integrate_once(din, fed, order - 1) }
+  def process(din: BigDecimal): Boolean = {
+    val fed = if (integral_values.last >= 0) ref else -ref
+    val result = integrate(din, fed)
+    result >= 0
+  }
+  def reset(): Unit = { integral_values = List.fill(order)(0.0) }
+}
+
 case class Integrator(outputWidth: Int) extends Component {
   val io = new Bundle {
     val output = master(Flow(SInt(outputWidth bits)))
@@ -55,7 +75,7 @@ case class Comb(outputWidth: Int) extends Component {
   }
 }
 case class SincGenerics(
-    val dr: Int = 2048,
+    val dr: Int = 32,
     val order: Int = 3,
     val outputWidthOrDefault: Int = 0,
     val maxOrder: Int = 6
@@ -63,9 +83,9 @@ case class SincGenerics(
 
 case class MySinc2(sincGenerics: SincGenerics) extends Component {
   val outputWidth =
-    2 + sincGenerics.order * log2Up(
+    sincGenerics.order * log2Up(
       sincGenerics.dr
-    ) // output width = input width + order * log2(DR) , input width = 1, sign width 1 bit
+    ) // output width = input width + order * log2(DR)
   val io = new Bundle {
     val input = slave(Flow(Bool())) // PWM 使用 Bool 类型
     val output = master(Flow(SInt(outputWidth bits)))
@@ -73,9 +93,10 @@ case class MySinc2(sincGenerics: SincGenerics) extends Component {
     // val samplingTick = in Bool()  // 采样时钟输入 125M
     val clk_divided = out Bool () // 分频后的时钟输出 20.83M
   }
-  val integrators = List.fill(sincGenerics.order)(Integrator(outputWidth))
-  val decimator = Decimator(sincGenerics.dr, outputWidth)
-  val combs = List.fill(sincGenerics.order)(Comb(outputWidth))
+  val rWidth = outputWidth + 2
+  val integrators = List.fill(sincGenerics.order)(Integrator(rWidth))
+  val decimator = Decimator(sincGenerics.dr, rWidth)
+  val combs = List.fill(sincGenerics.order)(Comb(rWidth))
 
   // 分频
   val clockDivider = new Area {
@@ -107,8 +128,10 @@ case class MySinc2(sincGenerics: SincGenerics) extends Component {
   integrators.zipWithIndex.foreach { case (integrator, i) =>
     if (i == 0) {
       // 第一个积分器：需要扩展 Bool 输入到 outputWidth
-      integrator.io.input.valid := sampler.tick
-      integrator.io.input.payload := sampler.value.asSInt.resize(outputWidth)
+      //   integrator.io.input.valid := sampler.tick
+      //   integrator.io.input.payload := Mux(sampler.value, S(1, outputWidth bits), S(-1, outputWidth bits))
+      integrator.io.input.valid := io.input.valid
+      integrator.io.input.payload := io.input.payload.asSInt.resize(rWidth)
     } else {
       integrator.io.input <> integrators(i - 1).io.output
     }
@@ -117,12 +140,13 @@ case class MySinc2(sincGenerics: SincGenerics) extends Component {
   combs.zipWithIndex.foreach { case (comb, i) =>
     comb.io.input <> (if (i == 0) decimator.io.output else combs(i - 1).io.output)
   }
-  io.output <> combs.last.io.output
+  val dec_rate = sincGenerics.dr
+  var raw = combs.last.io.output.payload + S((1 << outputWidth - 1) - 1, rWidth bits)
+  val min_val = -S((1 << outputWidth - 1), rWidth bits)
+  val diff3 = Mux(raw < min_val, min_val, raw)
+  io.output.valid := combs.last.io.output.valid
+  io.output.payload := diff3(outputWidth - 1 downto 0)
 
-}
-
-object MySinc2Verilog extends App {
-  Config.spinal.generateVerilog(MySinc2(SincGenerics(dr = 2048, order = 3, outputWidthOrDefault = 35, maxOrder = 3)))
 }
 
 object MySincTest extends App {
@@ -143,49 +167,24 @@ object MySincTest extends App {
     // 等待复位完成
     dut.clockDomain.waitRisingEdge()
 
-    println("=" * 60)
-    println("测试 PWM 正弦波")
-    println("信号: 50*sin(400*π*t), PWM频率100kHz")
-    println("SINC滤波器: DR=8, Order=3, Fs_out=250kHz")
-    println("=" * 60)
+    // 将激励时间基准与DUT时钟一致：125 MHz
+    val samplingFreq = 20000000.0 // 20 MHz 采样频率 这也是输入给modulator的时钟
+    val totalSamples = 200000 // 总采样点数
+    val signalFreq = 300000.0
 
-    val random = new Random()
-    val samplingFreq = 2000000.0 // 2 MHz 采样频率
-    val signalFreq = 200.0 // 200 Hz 信号频率
-    val amplitude = 50.0
-    val pwmFreq = 100000.0 // 100 kHz PWM 频率（每周期20个采样点）
-    val totalSamples = 50000 // 总采样点数 (25ms数据)
-    val noiseLevel = 0.05 // 5% 噪声
-    val DR = 8 // 抽取率 (与硬件参数一致)
+    val modulator = IdealSigmaDeltaModulator(order = 2, ref = 1.0)
+    modulator.reset()
 
     // 模拟 PWM 输入
     for (sample <- 0 until totalSamples) {
       val t = sample.toDouble / samplingFreq // 转换为 Double
 
-      // 生成正弦波值 + 噪声
       val sineValue = sin(2 * Pi * signalFreq * t)
-      val noise = random.nextGaussian() * noiseLevel * amplitude
-      val signalWithNoise = sineValue + noise
-      //   val signalWithNoise = sineValue  // 暂时不加噪声
-
-      // 将模拟值转换为 PWM (归一化到 0-1)
-      var duty = amplitude * (sineValue + 1)
-      if (duty < 0) duty = 0
-      else if (duty > 2 * amplitude) duty = 2 * amplitude
-
-      val car_phase = pwmFreq * t
-      val pwmThreshold = car_phase - floor(car_phase)
-      val pwm = 2 * amplitude * pwmThreshold
-
-      // PWM 比较: 如果归一化值大于阈值则输出1，否则0
-      val pwmBit = if (duty > pwm) true else false
-
-      // 将正弦波值转换为整数（用于调试显示）
-      val sineInt = (amplitude * sineValue).toInt
+      val bit = modulator.process(sineValue)
 
       // 输入到设计
       dut.io.input.valid #= true
-      dut.io.input.payload #= pwmBit
+      dut.io.input.payload #= bit
 
       // 等待时钟
       dut.clockDomain.waitRisingEdge()
@@ -195,19 +194,6 @@ object MySincTest extends App {
       val valid = dut.io.output.valid.toBoolean
       val clkDiv = dut.io.clk_divided.toBoolean
 
-      // 只在valid=true时打印（有效的抽取输出）
-      if (valid) {
-        val gain = 512.0 // DR^Order = 8^3 = 512
-        val scaledOutput = output / gain
-        println(
-          f"样本 $sample%6d: 时间=${t * 1000}%.3fms, 正弦=$sineInt%4d, 输出=$output%8d, 缩放=$scaledOutput%6.2f, clkDiv=$clkDiv"
-        )
-      }
-
-      // 进度指示
-      if (sample % 10000 == 0 && sample > 0) {
-        println(s"  [进度] 已处理 $sample 个样本...")
-      }
     }
 
     println("=" * 60)
