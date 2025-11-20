@@ -170,24 +170,26 @@ object MySincTest extends App {
     // 将激励时间基准与DUT时钟一致：125 MHz
     val samplingFreq = 20000000.0 // 20 MHz 采样频率 这也是输入给modulator的时钟
     val totalSamples = 200000 // 总采样点数
-    val signalFreq = 300000.0
+    val signalFreq = 150000.0
 
     val modulator = IdealSigmaDeltaModulator(order = 2, ref = 1.0)
     modulator.reset()
 
     // 模拟 PWM 输入
     for (sample <- 0 until totalSamples) {
-      val t = sample.toDouble / samplingFreq // 转换为 Double
+      val t = sample * 8e-9
 
-      val sineValue = sin(2 * Pi * signalFreq * t)
-      val bit = modulator.process(sineValue)
+      dut.io.input.valid #= sample % 6 == 0
+      if (sample % 6 == 0) {
+        val sineValue = 0.9 * sin(2 * Pi * signalFreq * t)
+        val bit = modulator.process(sineValue)
 
-      // 输入到设计
-      dut.io.input.valid #= true
-      dut.io.input.payload #= bit
+        // 输入到设计
+        dut.io.input.payload #= bit
+      }
 
       // 等待时钟
-      dut.clockDomain.waitRisingEdge()
+      dut.clockDomain.waitSampling()
 
       // 读取输出
       val output = dut.io.output.payload.toInt
