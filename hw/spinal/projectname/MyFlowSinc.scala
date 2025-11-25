@@ -168,7 +168,6 @@ object MySincTest extends App {
     dut.clockDomain.waitRisingEdge()
 
     // 将激励时间基准与DUT时钟一致：125 MHz
-    val samplingFreq = 20000000.0 // 20 MHz 采样频率 这也是输入给modulator的时钟
     val totalSamples = 200000 // 总采样点数
     val signalFreq = 150000.0
 
