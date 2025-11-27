@@ -5,6 +5,54 @@ import spinal.lib._
 import spinal.core.sim._
 import spinal.sim._
 
+case class MyRamIntegrator(width: Int) extends Component {
+  val io = new Bundle {
+    val input = slave(Flow(SInt(width bits)))
+    val output = master(Flow(SInt(width bits)))
+  }
+  
+  val sumReg = Reg(SInt(width bits)) init (0)
+  
+  io.output.payload := sumReg
+  io.output.valid := io.input.valid
+  
+  when(io.input.valid) {
+    sumReg := sumReg + io.input.payload
+  }
+}
+
+case class MyRamDecimator(dr: Int, outputWidth: Int) extends Component {
+  val io = new Bundle {
+    val output = Vec(master(Flow(SInt(outputWidth bits))), dr)
+    val input = slave(Flow(SInt(outputWidth bits)))
+  }
+  
+  // 创建 DR 个并行的抽取器，每个偏移 1 个时钟周期
+  val counters = Vec(Reg(UInt(log2Up(dr) bits)) init(0), dr)
+  val dataRegs = Vec(Reg(SInt(outputWidth bits)) init(0), dr)
+  
+  // 初始化每个计数器的偏移
+  for (i <- 0 until dr) {
+    counters(i).init(i)
+  }
+  
+  // 每个抽取器独立工作
+  for (i <- 0 until dr) {
+    io.output(i).valid := False
+    io.output(i).payload := dataRegs(i)
+    
+    when(io.input.valid) {
+      when(counters(i) === (dr - 1)) {
+        dataRegs(i) := io.input.payload
+        io.output(i).valid := True
+        counters(i) := 0
+      } otherwise {
+        counters(i) := counters(i) + 1
+      }
+    }
+  }
+}
+
 case class MyRamComb(outputWidth: Int, order: Int) extends Component {
   val io = new Bundle {
     val output = master(Flow(SInt(outputWidth bits)))
@@ -56,10 +104,12 @@ case class MyRamSinc(sincGenerics: SincGenerics) extends Component {
   }
   val rWidth = outputWidth + 2
   val integrators = List.fill(sincGenerics.order)(Integrator(rWidth))
-  val decimator = Decimator(sincGenerics.dr, rWidth)
+  val decimator = MyRamDecimator(sincGenerics.dr, rWidth)
   
-  // 创建单个 MyRamComb 处理所有 order 个差分
-  val comb = MyRamComb(rWidth, sincGenerics.order)
+  // 创建 DR 个 MyRamComb，每个处理一个 decimator 输出
+  val combs = (0 until sincGenerics.dr).map { _ =>
+    MyRamComb(rWidth, sincGenerics.order)
+  }.toList
 
   // 分频
   val clockDivider = new Area {
@@ -101,14 +151,35 @@ case class MyRamSinc(sincGenerics: SincGenerics) extends Component {
   }
   decimator.io.input <> integrators.last.io.output
   
-  // 连接单个 comb（内部处理所有 order 个差分）
-  comb.io.input <> decimator.io.output
- 
+  // 连接每个 decimator 输出到对应的 comb
+  combs.zipWithIndex.foreach { case (comb, i) =>
+    comb.io.input <> decimator.io.output(i)
+  }
+  
+  // 合并所有 comb 的输出
+  // 使用优先级编码器选择第一个有效的输出
+  val combOutputs = Vec(combs.map(_.io.output.payload))
+  val combValids = Vec(combs.map(_.io.output.valid))
+  
+  // 找到第一个有效的输出（优先级编码）
+  val selectedPayload = SInt(rWidth bits)
+  val selectedValid = Bool()
+  
+  selectedPayload := S(0, rWidth bits)
+  selectedValid := False
+  
+  for (i <- (sincGenerics.dr - 1) downto 0) {
+    when(combValids(i)) {
+      selectedPayload := combOutputs(i)
+      selectedValid := True
+    }
+  }
+  
   val dec_rate = sincGenerics.dr
-  var raw = comb.io.output.payload + S((1 << outputWidth - 1) - 1, rWidth bits)
+  var raw = selectedPayload + S((1 << outputWidth - 1) - 1, rWidth bits)
   val min_val = -S((1 << outputWidth - 1), rWidth bits)
   val diff3 = Mux(raw < min_val, min_val, raw)
-  io.output.valid := comb.io.output.valid
+  io.output.valid := selectedValid
   io.output.payload := diff3(outputWidth - 1 downto 0)
 
 }
@@ -133,7 +204,7 @@ object MyRamSincTest extends App {
 
     // 将激励时间基准与DUT时钟一致：125 MHz
     val totalSamples = 200000 // 总采样点数
-    val signalFreq = 15000.0
+    val signalFreq = 125000.0
 
     val modulator = IdealSigmaDeltaModulator(order = 2, ref = 1.0)
     modulator.reset()
