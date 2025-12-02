@@ -227,7 +227,7 @@ object MyRamSincTest extends App {
 
     // 将激励时间基准与DUT时钟一致：125 MHz
     val totalSamples = 200000 // 总采样点数
-    val signalFreq = 200000.0
+    val signalFreq = 125000.0
 
     val modulator = IdealSigmaDeltaModulator(order = 2, ref = 1.0)
     modulator.reset()
