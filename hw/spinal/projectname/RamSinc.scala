@@ -5,20 +5,42 @@ import spinal.lib._
 import spinal.core.sim._
 import spinal.sim._
 
-case class MyRamIntegrator(width: Int) extends Component {
+case class MyRamIntegrator(width: Int, order: Int) extends Component {
   val io = new Bundle {
     val input = slave(Flow(SInt(width bits)))
     val output = master(Flow(SInt(width bits)))
   }
   
-  val sumReg = Reg(SInt(width bits)) init (0)
+  // 共享 RAM 存储 order 个积分器的累加值
+  val sumRam = Mem(SInt(width bits), wordCount = order)
+  sumRam.init(Seq.fill(order)(S(0, width bits)))
   
-  io.output.payload := sumReg
-  io.output.valid := io.input.valid
+  // 地址位宽
+  val addrWidth = log2Up(order)
   
-  when(io.input.valid) {
-    sumReg := sumReg + io.input.payload
+  // 延迟输入和valid一个周期，对齐 readSync 延迟
+  val inputDelay = RegNext(io.input.payload) init(S(0, width bits))
+  val validDelay = RegNext(io.input.valid) init(False)
+  
+  // 发起所有 readSync 读取
+  val readValues = (0 until order).map { i =>
+    sumRam.readSync(U(i, addrWidth bits))
   }
+  
+  // 使用延迟后的输入和 readSync 读出的值计算
+  var currentValue = inputDelay
+  
+  for (i <- 0 until order) {
+    val newSum = currentValue + readValues(i)
+    // 只在 validDelay 为真时写入
+    when(validDelay) {
+      sumRam.write(U(i, addrWidth bits), newSum)
+    }
+    currentValue = newSum
+  }
+  
+  io.output.valid := validDelay
+  io.output.payload := currentValue
 }
 
 case class MyRamDecimator(dr: Int, outputWidth: Int) extends Component {
@@ -29,7 +51,12 @@ case class MyRamDecimator(dr: Int, outputWidth: Int) extends Component {
   
   // 创建 DR 个并行的抽取器，每个偏移 1 个时钟周期
   val counters = Vec(Reg(UInt(log2Up(dr) bits)) init(0), dr)
-  val dataRegs = Vec(Reg(SInt(outputWidth bits)) init(0), dr)
+  
+  // 用 Mem 代替 dataRegs
+  val dataMem = Mem(SInt(outputWidth bits), wordCount = dr)
+  dataMem.init(Seq.fill(dr)(S(0, outputWidth bits)))
+  
+  val addrWidth = log2Up(dr)
   
   // 初始化每个计数器的偏移
   for (i <- 0 until dr) {
@@ -38,12 +65,14 @@ case class MyRamDecimator(dr: Int, outputWidth: Int) extends Component {
   
   // 每个抽取器独立工作
   for (i <- 0 until dr) {
+    // 从 Mem 读取数据
+    io.output(i).payload := dataMem.readAsync(U(i, addrWidth bits))
     io.output(i).valid := False
-    io.output(i).payload := dataRegs(i)
     
     when(io.input.valid) {
       when(counters(i) === (dr - 1)) {
-        dataRegs(i) := io.input.payload
+        // 写入 Mem
+        dataMem.write(U(i, addrWidth bits), io.input.payload)
         io.output(i).valid := True
         counters(i) := 0
       } otherwise {
@@ -103,7 +132,7 @@ case class MyRamSinc(sincGenerics: SincGenerics) extends Component {
     val clk_divided = out Bool () // 分频后的时钟输出 20.83M
   }
   val rWidth = outputWidth + 2
-  val integrators = List.fill(sincGenerics.order)(Integrator(rWidth))
+  val integrator = MyRamIntegrator(rWidth, sincGenerics.order)
   val decimator = MyRamDecimator(sincGenerics.dr, rWidth)
   
   // 创建 DR 个 MyRamComb，每个处理一个 decimator 输出
@@ -138,18 +167,12 @@ case class MyRamSinc(sincGenerics: SincGenerics) extends Component {
   }
 
   // 连接流水线组件
-  integrators.zipWithIndex.foreach { case (integrator, i) =>
-    if (i == 0) {
-      // 第一个积分器：需要扩展 Bool 输入到 outputWidth
-      //   integrator.io.input.valid := sampler.tick
-      //   integrator.io.input.payload := Mux(sampler.value, S(1, outputWidth bits), S(-1, outputWidth bits))
-      integrator.io.input.valid := io.input.valid
-      integrator.io.input.payload := io.input.payload.asSInt.resize(rWidth)
-    } else {
-      integrator.io.input <> integrators(i - 1).io.output
-    }
-  }
-  decimator.io.input <> integrators.last.io.output
+  // 连接积分器
+  integrator.io.input.valid := io.input.valid
+  integrator.io.input.payload := io.input.payload.asSInt.resize(rWidth)
+  
+  // 连接抽取器
+  decimator.io.input <> integrator.io.output
   
   // 连接每个 decimator 输出到对应的 comb
   combs.zipWithIndex.foreach { case (comb, i) =>
@@ -204,7 +227,7 @@ object MyRamSincTest extends App {
 
     // 将激励时间基准与DUT时钟一致：125 MHz
     val totalSamples = 200000 // 总采样点数
-    val signalFreq = 125000.0
+    val signalFreq = 200000.0
 
     val modulator = IdealSigmaDeltaModulator(order = 2, ref = 1.0)
     modulator.reset()
