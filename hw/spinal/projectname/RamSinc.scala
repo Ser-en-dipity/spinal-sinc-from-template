@@ -9,35 +9,31 @@ case class MyRamIntegrator(width: Int, order: Int) extends Component {
   val io = new Bundle {
     val input = slave(Flow(SInt(width bits)))
     val output = master(Flow(SInt(width bits)))
+    // 共享内存接口：由外部（SharedRam）提供读取值，并接受写回值
+    val ramReadValues = in Vec(SInt(width bits), order)
+    val ramWriteValues = out Vec(SInt(width bits), order)
+    val ramWriteEn = out Bool()
   }
   
-  // 共享 RAM 存储 order 个积分器的累加值
-  val sumRam = Mem(SInt(width bits), wordCount = order)
-  sumRam.init(Seq.fill(order)(S(0, width bits)))
-  
-  // 地址位宽
-  val addrWidth = log2Up(order)
+  // 不在本组件中直接访问 Mem，避免层级违规
   
   // 延迟输入和valid一个周期，对齐 readSync 延迟
   val inputDelay = RegNext(io.input.payload) init(S(0, width bits))
   val validDelay = RegNext(io.input.valid) init(False)
   
   // 发起所有 readSync 读取
-  val readValues = (0 until order).map { i =>
-    sumRam.readSync(U(i, addrWidth bits))
-  }
+  val readValues = io.ramReadValues
   
   // 使用延迟后的输入和 readSync 读出的值计算
   var currentValue = inputDelay
   
   for (i <- 0 until order) {
     val newSum = currentValue + readValues(i)
-    // 只在 validDelay 为真时写入
-    when(validDelay) {
-      sumRam.write(U(i, addrWidth bits), newSum)
-    }
+    // 写回由上层完成
+    io.ramWriteValues(i) := newSum
     currentValue = newSum
   }
+  io.ramWriteEn := validDelay
   
   io.output.valid := validDelay
   io.output.payload := currentValue
@@ -47,16 +43,16 @@ case class MyRamDecimator(dr: Int, outputWidth: Int) extends Component {
   val io = new Bundle {
     val output = Vec(master(Flow(SInt(outputWidth bits))), dr)
     val input = slave(Flow(SInt(outputWidth bits)))
+    // 共享内存接口：提供读出的每个lane数据，以及写回数据与使能
+    val ramReadValues = in Vec(SInt(outputWidth bits), dr)
+    val ramWriteValues = out Vec(SInt(outputWidth bits), dr)
+    val ramWriteEns = out Vec(Bool(), dr)
   }
   
   // 创建 DR 个并行的抽取器，每个偏移 1 个时钟周期
   val counters = Vec(Reg(UInt(log2Up(dr) bits)) init(0), dr)
   
-  // 用 Mem 代替 dataRegs
-  val dataMem = Mem(SInt(outputWidth bits), wordCount = dr)
-  dataMem.init(Seq.fill(dr)(S(0, outputWidth bits)))
-  
-  val addrWidth = log2Up(dr)
+  // 不在本组件中直接访问 Mem，避免层级违规
   
   // 初始化每个计数器的偏移
   for (i <- 0 until dr) {
@@ -66,13 +62,16 @@ case class MyRamDecimator(dr: Int, outputWidth: Int) extends Component {
   // 每个抽取器独立工作
   for (i <- 0 until dr) {
     // 从 Mem 读取数据
-    io.output(i).payload := dataMem.readAsync(U(i, addrWidth bits))
+    io.output(i).payload := io.ramReadValues(i)
     io.output(i).valid := False
+    io.ramWriteValues(i) := io.ramReadValues(i)
+    io.ramWriteEns(i) := False
     
     when(io.input.valid) {
       when(counters(i) === (dr - 1)) {
-        // 写入 Mem
-        dataMem.write(U(i, addrWidth bits), io.input.payload)
+        // 写回由上层完成
+        io.ramWriteValues(i) := io.input.payload
+        io.ramWriteEns(i) := True
         io.output(i).valid := True
         counters(i) := 0
       } otherwise {
@@ -86,14 +85,13 @@ case class MyRamComb(outputWidth: Int, order: Int) extends Component {
   val io = new Bundle {
     val output = master(Flow(SInt(outputWidth bits)))
     val input = slave(Flow(SInt(outputWidth bits)))
+    // 共享内存接口：提供前一次值读出，并给出写回当前值和使能
+    val ramReadValues = in Vec(SInt(outputWidth bits), order)
+    val ramWriteValues = out Vec(SInt(outputWidth bits), order)
+    val ramWriteEn = out Bool()
   }
   
-  // 共享 RAM 存储 order 个差分器的数据
-  val dataRam = Mem(SInt(outputWidth bits), wordCount = order)
-  dataRam.init(Seq.fill(order)(S(0, outputWidth bits)))
-  
-  // 地址位宽
-  val addrWidth = log2Up(order)
+  // 不在本组件中直接访问 Mem，避免层级违规
   
   // 存储 order 个差分器的中间结果和输出
   var currentValue = io.input.payload
@@ -102,17 +100,18 @@ case class MyRamComb(outputWidth: Int, order: Int) extends Component {
   // 依次处理 order 个差分器
   for (i <- 0 until order) {
     // readSync 读取第 i 个差分器的上一次值
-    val prevData = dataRam.readSync(U(i, addrWidth bits))
+    val prevData = io.ramReadValues(i)
     
     // 计算差值
     val diff = currentValue - prevData
     
     // 写入当前值到第 i 个地址
-    dataRam.write(U(i, addrWidth bits), currentValue, enable = currentValid)
+    io.ramWriteValues(i) := currentValue
     
     // 更新为下一级的输入
     currentValue = Mux(currentValid, diff, S(0, outputWidth bits))
   }
+  io.ramWriteEn := currentValid
   
   // 最终输出
   io.output.valid := currentValid
@@ -139,6 +138,64 @@ case class MyRamSinc(sincGenerics: SincGenerics) extends Component {
   val combs = (0 until sincGenerics.dr).map { _ =>
     MyRamComb(rWidth, sincGenerics.order)
   }.toList
+
+  // 内部共享内存封装：单一共享内存，统一地址空间，全部使用 readSync
+  val SharedRam = new Area {
+    val intSize = sincGenerics.order
+    val decSize = sincGenerics.dr
+    val combStageSize = sincGenerics.order
+    val combInstanceCount = sincGenerics.dr // 每个 decimator 输出对应一个 comb
+    val combTotalSize = combStageSize * combInstanceCount
+
+    val totalWords = intSize + decSize + combTotalSize
+    val addrWidth = log2Up(totalWords)
+    val mem = Mem(SInt(rWidth bits), wordCount = totalWords)
+    mem.init(Seq.fill(totalWords)(S(0, rWidth bits)))
+
+    // 地址基址分配
+    val baseInt = 0
+    val baseDec = baseInt + intSize
+    val baseComb = baseDec + decSize
+
+    // Integrator reads/writes [baseInt .. baseInt+intSize)
+    val intReadValues = Vec(SInt(rWidth bits), intSize)
+    for (i <- 0 until intSize) {
+      intReadValues(i) := mem.readSync(U(baseInt + i, addrWidth bits))
+    }
+    integrator.io.ramReadValues := intReadValues
+    when(integrator.io.ramWriteEn) {
+      for (i <- 0 until intSize) {
+        mem.write(U(baseInt + i, addrWidth bits), integrator.io.ramWriteValues(i))
+      }
+    }
+
+    // Decimator reads/writes [baseDec .. baseDec+decSize)
+    val decReadValues = Vec(SInt(rWidth bits), decSize)
+    for (i <- 0 until decSize) {
+      decReadValues(i) := mem.readSync(U(baseDec + i, addrWidth bits))
+    }
+    decimator.io.ramReadValues := decReadValues
+    for (i <- 0 until decSize) {
+      when(decimator.io.ramWriteEns(i)) {
+        mem.write(U(baseDec + i, addrWidth bits), decimator.io.ramWriteValues(i))
+      }
+    }
+
+    // Combs: allocate dedicated slice per comb instance sequentially in shared memory
+    combs.zipWithIndex.foreach { case (c, idx) =>
+      val base = baseComb + idx * combStageSize
+      val combReadValues = Vec(SInt(rWidth bits), combStageSize)
+      for (i <- 0 until combStageSize) {
+        combReadValues(i) := mem.readSync(U(base + i, addrWidth bits))
+      }
+      c.io.ramReadValues := combReadValues
+      when(c.io.ramWriteEn) {
+        for (i <- 0 until combStageSize) {
+          mem.write(U(base + i, addrWidth bits), c.io.ramWriteValues(i))
+        }
+      }
+    }
+  }
 
   // 分频
   val clockDivider = new Area {
@@ -207,6 +264,9 @@ case class MyRamSinc(sincGenerics: SincGenerics) extends Component {
 
 }
 
+object MyRamSincVerilog extends App {
+  Config.spinal.generateVerilog(MyRamSinc(SincGenerics(dr = 32, order = 3)))
+}
 object MyRamSincTest extends App {
   // 测试 PWM 正弦波输入
   SimConfig.withWave.compile(new MyRamSinc(SincGenerics(dr = 32, order = 3))).doSim { dut =>
@@ -227,7 +287,7 @@ object MyRamSincTest extends App {
 
     // 将激励时间基准与DUT时钟一致：125 MHz
     val totalSamples = 200000 // 总采样点数
-    val signalFreq = 125000.0
+    val signalFreq = 115000.0
 
     val modulator = IdealSigmaDeltaModulator(order = 2, ref = 1.0)
     modulator.reset()
